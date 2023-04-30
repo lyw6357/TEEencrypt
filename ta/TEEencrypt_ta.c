@@ -27,8 +27,19 @@
 
 #include <tee_internal_api.h>
 #include <tee_internal_api_extensions.h>
-
 #include <TEEencrypt_ta.h>
+#include <string.h>
+
+#define RSA_KEY_SIZE 1024
+#define MAX_PLAIN_LEN_1024 86 // (1024/8) - 42 (padding)
+#define RSA_CIPHER_LEN_1024 (RSA_KEY_SIZE / 8)
+
+int rootKey = 7;
+
+struct rsa_session {
+	TEE_OperationHandle op_handle;	/* RSA operation */
+	TEE_ObjectHandle key_handle; /* Key handle */
+};
 
 /*
  * Called when the instance of the TA is created. This is the first call in
@@ -60,7 +71,7 @@ TEE_Result TA_OpenSessionEntryPoint(uint32_t param_types,
 		TEE_Param __maybe_unused params[4],
 		void __maybe_unused **sess_ctx)
 {
-	uint32_t exp_param_types = TEE_PARAM_TYPES(TEE_PARAM_TYPE_NONE,
+  uint32_t exp_param_types = TEE_PARAM_TYPES(TEE_PARAM_TYPE_NONE,
 						   TEE_PARAM_TYPE_NONE,
 						   TEE_PARAM_TYPE_NONE,
 						   TEE_PARAM_TYPE_NONE);
@@ -70,15 +81,19 @@ TEE_Result TA_OpenSessionEntryPoint(uint32_t param_types,
 	if (param_types != exp_param_types)
 		return TEE_ERROR_BAD_PARAMETERS;
 
-	/* Unused parameters */
-	(void)&params;
-	(void)&sess_ctx;
+	struct rsa_session *sess;
+	sess = TEE_Malloc(sizeof(*sess), 0);
 
-	/*
-	 * The DMSG() macro is non-standard, TEE Internal API doesn't
-	 * specify any means to logging from a TA.
-	 */
-	IMSG("Hello World!\n");
+	if (!sess)
+		return TEE_ERROR_OUT_OF_MEMORY;
+
+	sess->key_handle = TEE_HANDLE_NULL;
+	sess->op_handle = TEE_HANDLE_NULL;
+
+	*sess_ctx = (void *)sess;
+	DMSG("\nSession %p: newly allocated\n", *sess_ctx);
+
+	IMSG("\n========== Open Session ==========\n");
 
 	/* If return value != TEE_SUCCESS the session will not be created. */
 	return TEE_SUCCESS;
@@ -90,49 +105,198 @@ TEE_Result TA_OpenSessionEntryPoint(uint32_t param_types,
  */
 void TA_CloseSessionEntryPoint(void __maybe_unused *sess_ctx)
 {
-	(void)&sess_ctx; /* Unused parameter */
-	IMSG("Goodbye!\n");
+
+	struct rsa_session *sess;
+
+	DMSG("Session %p: release session", sess_ctx);
+	sess = (struct rsa_session *)sess_ctx;
+
+	if (sess->key_handle != TEE_HANDLE_NULL)
+		TEE_FreeTransientObject(sess->key_handle);
+	if (sess->op_handle != TEE_HANDLE_NULL)
+		TEE_FreeOperation(sess->op_handle);
+	TEE_Free(sess);
+
+	IMSG("\n==================== Close Session ====================\n");
 }
 
-static TEE_Result inc_value(uint32_t param_types,
+static TEE_Result encrypt(uint32_t param_types,
 	TEE_Param params[4])
 {
-	uint32_t exp_param_types = TEE_PARAM_TYPES(TEE_PARAM_TYPE_VALUE_INOUT,
-						   TEE_PARAM_TYPE_NONE,
-						   TEE_PARAM_TYPE_NONE,
-						   TEE_PARAM_TYPE_NONE);
+	int randomKey = 0;
 
-	DMSG("has been called");
+	while(randomKey % 26 == 0 || randomKey < 0){
+		TEE_GenerateRandom(&randomKey, sizeof(randomKey));
+		randomKey %= 26;
+	}
 
-	if (param_types != exp_param_types)
-		return TEE_ERROR_BAD_PARAMETERS;
+	DMSG("randomKey: %d", randomKey);
 
-	IMSG("Got value: %u from NW", params[0].value.a);
-	params[0].value.a++;
-	IMSG("Increase value to: %u", params[0].value.a);
+	char * in = (char *)params[0].memref.buffer;
+	int in_len = strlen (params[0].memref.buffer);
+	char encrypted [64] = {0, };
 
+	DMSG("\n==================== Encryption ====================\n");
+        DMSG("\n-------------------- Plaintext --------------------\n%s\n", in);
+	memcpy(encrypted, in, in_len);
+
+	for (int i = 0; i < in_len; i++){
+		if (encrypted[i] >= 'a' && encrypted[i] <= 'z'){
+			encrypted[i] -= 'a';
+			encrypted[i] += randomKey;
+			encrypted[i] = encrypted[i] % 26;
+			encrypted[i] += 'a';
+		}
+		else if (encrypted[i] >= 'A' && encrypted[i] <= 'Z') {
+			encrypted[i] -= 'A';
+			encrypted[i] += randomKey;
+			encrypted[i] = encrypted[i] % 26;
+			encrypted[i] += 'A';
+		}
+	}
+	DMSG("\n-------------------- Ciphertext --------------------\n%s\n", encrypted);
+	memcpy(in, encrypted, in_len);
+
+	int encKey = rootKey + randomKey;
+	params[1].value.a = encKey;
+	DMSG("encKey: %d\n", encKey);
+
+	DMSG("\n==================== Encryption successfully ====================");
 	return TEE_SUCCESS;
 }
 
-static TEE_Result dec_value(uint32_t param_types,
+static TEE_Result decrypt(uint32_t param_types,
 	TEE_Param params[4])
 {
-	uint32_t exp_param_types = TEE_PARAM_TYPES(TEE_PARAM_TYPE_VALUE_INOUT,
-						   TEE_PARAM_TYPE_NONE,
-						   TEE_PARAM_TYPE_NONE,
-						   TEE_PARAM_TYPE_NONE);
-
 	DMSG("has been called");
 
-	if (param_types != exp_param_types)
-		return TEE_ERROR_BAD_PARAMETERS;
+	int encKey = params[1].value.a;
+	int randomKey = encKey - rootKey;
 
-	IMSG("Got value: %u from NW", params[0].value.a);
-	params[0].value.a--;
-	IMSG("Decrease value to: %u", params[0].value.a);
-
+	char * in = (char *)params[0].memref.buffer;
+	int in_len = strlen (params[0].memref.buffer);
+	char decrypted [64] = {0, };
+	
+	DMSG("\n==================== Decryption ====================\n");
+	DMSG("\n-------------------- Ciphertext --------------------\n%s\n", in);
+	memcpy(decrypted, in, in_len);
+	
+	for (int i = 0; i < in_len; i++){
+		if (decrypted[i] >= 'a' && decrypted[i] <= 'z'){
+			decrypted[i] -= 'a';
+			decrypted[i] -= randomKey;
+			decrypted[i] += 26;
+			decrypted[i] = decrypted[i] % 26;
+			decrypted[i] += 'a';
+		}
+		else if (decrypted[i] >= 'A' && decrypted[i] <= 'Z') {
+			decrypted[i] -= 'A';
+			decrypted[i] -= randomKey;
+			decrypted[i] += 26;
+			decrypted[i] = decrypted[i] % 26;
+			decrypted[i] += 'A';
+		}
+	}
+	DMSG("\n-------------------- Plaintext --------------------\n%s\n", decrypted);
+	memcpy(in, decrypted, in_len);
+	
+	DMSG("\n==================== Decryption successfully ====================");
 	return TEE_SUCCESS;
 }
+
+static TEE_Result prepare_rsa_operation(TEE_OperationHandle *handle, uint32_t alg, TEE_OperationMode mode, TEE_ObjectHandle _key) {
+	TEE_Result ret = TEE_SUCCESS;	
+	TEE_ObjectInfo key_info;
+	ret = TEE_GetObjectInfo1(_key, &key_info);
+	if (ret != TEE_SUCCESS) {
+		EMSG("\nTEE_GETObjectInfo1\n");
+		return ret;
+	}
+
+	ret = TEE_AllocateOperation(handle, alg, mode, key_info.keySize);
+	if (ret != TEE_SUCCESS) {
+		EMSG("\nFailed to alloc operation handle : 0x%x\n", ret);
+		return ret;
+	}
+	DMSG("\n========== Operation allocated successfully. ==========\n");
+
+	ret = TEE_SetOperationKey(*handle, _key);
+	if (ret != TEE_SUCCESS) {
+		EMSG("\nFailed to set key : 0x%x\n", ret);
+		return ret;
+	}
+    	DMSG("\n========== Operation key already set. ==========\n");
+
+	return ret;
+}
+
+TEE_Result RSA_create_key_pair(void *session) {
+	TEE_Result ret;
+	size_t key_size = RSA_KEY_SIZE;
+	struct rsa_session *sess = (struct rsa_session *)session;
+	
+	ret = TEE_AllocateTransientObject(TEE_TYPE_RSA_KEYPAIR, key_size, &sess->key_handle);
+	if (ret != TEE_SUCCESS) {
+		EMSG("\nFailed to alloc transient object handle: 0x%x\n", ret);
+		return ret;
+	}
+	DMSG("\n========== Transient object allocated. ==========\n");
+
+	ret = TEE_GenerateKey(sess->key_handle, key_size, (TEE_Attribute *)NULL, 0);
+	if (ret != TEE_SUCCESS) {
+		EMSG("\nGenerate key failure: 0x%x\n", ret);
+		return ret;
+	}
+	DMSG("\n========== Keys generated. ==========\n");
+	return ret;
+}
+
+TEE_Result RSA_encrypt(void *session, uint32_t param_types, TEE_Param params[4]) {
+	TEE_Result ret;
+	uint32_t rsa_alg = TEE_ALG_RSAES_PKCS1_V1_5;
+	struct rsa_session *sess = (struct rsa_session *)session;
+
+	DMSG("\n==================== Encryption ====================\n");
+	uint32_t exp_param_types = TEE_PARAM_TYPES(TEE_PARAM_TYPE_MEMREF_OUTPUT,
+						   TEE_PARAM_TYPE_VALUE_INOUT,
+						   TEE_PARAM_TYPE_MEMREF_INPUT,
+						   TEE_PARAM_TYPE_MEMREF_OUTPUT);
+	if (param_types != exp_param_types)
+		return TEE_ERROR_BAD_PARAMETERS;
+	DMSG("\n========== Check Params success ==========\n");
+	
+	void *plain_txt = params[2].memref.buffer;
+	size_t plain_len = params[2].memref.size;
+	void *cipher_txt = params[3].memref.buffer;
+	size_t cipher_len = params[3].memref.size;
+
+	DMSG("\n========== Preparing encryption operation ==========\n");
+	ret = prepare_rsa_operation(&sess->op_handle, rsa_alg, TEE_MODE_ENCRYPT, sess->key_handle);
+	if (ret != TEE_SUCCESS) {
+		EMSG("\nFailed to prepare RSA operation: 0x%x\n", ret);
+		goto err;
+	}
+
+	DMSG("\n-------------------- Plaintext --------------------\n%s\n", (char *) plain_txt);
+	ret = TEE_AsymmetricEncrypt(sess->op_handle, NULL, 0, 
+					plain_txt, plain_len, cipher_txt, &cipher_len);	
+
+	if (ret != TEE_SUCCESS) {
+		EMSG("\nFailed to encrypt the passed buffer: 0x%x\n", ret);
+		goto err; 
+	}
+	memcpy(params[3].memref.buffer, cipher_txt, cipher_len);
+	DMSG("\n-------------------- Ciphertext --------------------\n%s\n", (char *) cipher_txt);
+	
+	DMSG("\n==================== Encryption successfully ====================");
+	return ret;
+
+err:
+	TEE_FreeOperation(sess->op_handle);
+	TEE_FreeOperation(sess->key_handle);
+	return ret;
+}
+
 /*
  * Called when a TA is invoked. sess_ctx hold that value that was
  * assigned by TA_OpenSessionEntryPoint(). The rest of the paramters
@@ -145,10 +309,14 @@ TEE_Result TA_InvokeCommandEntryPoint(void __maybe_unused *sess_ctx,
 	(void)&sess_ctx; /* Unused parameter */
 
 	switch (cmd_id) {
-	case TA_TEEencrypt_CMD_INC_VALUE:
-		return inc_value(param_types, params);
-	case TA_TEEencrypt_CMD_DEC_VALUE:
-		return dec_value(param_types, params);
+	case TA_TEEencrypt_CMD_ENCRYPT:
+		return encrypt(param_types, params);
+	case TA_TEEencrypt_CMD_DECRYPT:
+		return decrypt(param_types, params);
+	case TA_RSA_CMD_GENKEYS:
+		return RSA_create_key_pair(sess_ctx);
+	case TA_RSA_CMD_ENCRYPT:
+		return RSA_encrypt(sess_ctx, param_types, params);
 	default:
 		return TEE_ERROR_BAD_PARAMETERS;
 	}

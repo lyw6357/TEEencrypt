@@ -37,7 +37,9 @@
 		{ 0x95, 0xfc, 0x94, 0x12, 0x33, 0xea, 0x83, 0x59} }
 
 /* The function IDs implemented in this TA */
-#define TA_TEEencrypt_CMD_INC_VALUE		0
-#define TA_TEEencrypt_CMD_DEC_VALUE		1
+#define TA_TEEencrypt_CMD_ENCRYPT	0
+#define TA_TEEencrypt_CMD_DECRYPT	1
+#define TA_RSA_CMD_GENKEYS		2
+#define TA_RSA_CMD_ENCRYPT		3
 
 #endif /*TA_TEEencrypt_H*/
